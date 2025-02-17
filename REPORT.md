@@ -24,3 +24,8 @@ with slots having values of 0 through 31. What this meant was that any incoming 
 (or assign one if needed), and then for any array storing snapshot data, it would access the index matching the binded slot to only see information about that specific snapshot.
 This allowed multiple snapshots to occur at once, as their data would now not conflict, meaning they would not mess each other up. This hopefully allows testcase-5 to run as intended,
 as now the 2 snapshots will no longer interfere with each other.
+
+Below is a simple state diagram (sort of) to help visualize the process. It mainly illustrates how process 1 starts a snapshot at state = 2, then waits 2 seconds before sending all markers out.
+Every process receives, then waits 2 more seconds, before sending all their markers out. This second wave ends the snapshot as all processes receive all other markers.
+
+<img title="State Diagram" src="state-diagram.jpg">
