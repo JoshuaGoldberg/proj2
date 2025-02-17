@@ -10,5 +10,7 @@ int setupFromFile(int argc, char *argv[]);
 int setupSocket();
 int sendToken();
 int snapshotHandler(int idbinding, int receivedSnapId, int i);
+int markerHandler(const char *msg, int i);
+int tokenHandler(const char * msg, int i);
 
 #endif

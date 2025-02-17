@@ -155,7 +155,7 @@ int setupFromFile(int argc, char *argv[]) {
     FILE * hostfile = fopen(hostfile_location, "r");
     if (hostfile == NULL) {
        perror("Error opening file");
-       return 1;
+       return -1;
     }
 
     // store a list of all host names
@@ -361,6 +361,161 @@ int snapshotHandler(int idbinding, int receivedSnapId, int i) {
     return 0;
 }
 
+int markerHandler(const char *msg, int i) {
+
+    int receivedSnapId;
+    sscanf(msg, "marker:%d", &receivedSnapId);    
+
+    int idbinding = -1;
+
+    // find the binding
+    for (int j = 0; j < 32; j++) {
+        
+        if(idbindings[j] == receivedSnapId) {
+            idbinding = j;
+        }
+
+    }
+
+    if(idbinding == -1) {
+        idbinding = idbindingsize;
+        idbindings[idbindingsize] = receivedSnapId;
+        idbindingsize += 1;
+    }
+
+    // check if we're in the process of a snapshot
+    if(snapshotting[idbinding] == 0) {
+
+        int snapshotHandlerRes = snapshotHandler(idbinding, receivedSnapId, i);
+
+    } else {
+
+        // already received a marker, just close the channel and send the message
+        closedChannels[idbinding][i] = 1;
+        fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"channel closed\", channel:%d-%d, queue:[%s]}\n",
+        processID, receivedSnapId, i, processID, channelQueues[idbinding][i]);
+
+    }
+
+    // we can now check here for snapshot completion
+    int numClosed = 0;
+    for(int i = 1; i <= host_num; i ++) {
+        if(i != processID) {
+            if(closedChannels[idbinding][i] == 1) {
+                numClosed += 1;
+            }
+        }
+    }
+
+    // check if we've closed all other channels (n - 1)
+    if(numClosed == host_num - 1) {
+
+        // time to say goodbye to our snapshotting
+        fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"complete\"}\n",
+        processID, receivedSnapId);
+
+        // goodbye snapshotting state o7
+        snapshotting[idbinding] = 0;
+        recording[idbinding] = 0;
+
+        //clear the queues and the closed channels for the next snapshot
+        // make sure to only clear one of them
+        for (int i = 1; i <= host_num; i++) {
+            if(i != processID) {
+                channelQueues[idbinding][i][0] = '\0';
+                closedChannels[idbinding][i] = 0;
+            }
+        }
+
+    }
+}
+
+int tokenHandler(const char * msg, int i) {
+
+    // dealing with a token, not a marker
+    // we now have the token!
+    hasToken = 1;
+    // record messages while snapshotting if the channel is not closed
+    for (int j = 0; j < 32; j ++) {
+
+        if(recording[j] == 1 && closedChannels[j][i] == 0) {
+
+            if (channelQueues[j][i][0] == '\0') {
+                strcat(channelQueues[j][i], msg); 
+            } else {
+                strcat(channelQueues[j][i], ",");
+                strcat(channelQueues[j][i], msg);
+            }
+
+        }
+
+    }
+
+    // print the received message
+    fprintf(stderr, "{proc_id: %d, sender: %s, receiver: %s, message:\"token\"}\n",
+        processID, hostNames[predID - 1], hostNames[processID - 1]);
+        
+    STATE += 1;
+    // prints the updated state
+    fprintf(stderr, "{proc_id: %d, state: %d}\n", processID, STATE);
+
+    // check if we should start a snapshot
+    // checks whether its in charge of starting a snapshot,
+    // whether the proper state has been reached, and whether it already performed its snapshot
+    if(snapshotStarter == 1 && STATE == snapshotDelay && completedSnapshot == 0) {
+        
+        completedSnapshot = 1;
+        snapshotting[idbindingsize] = 1;
+        idbindings[idbindingsize] = snapshotID;
+        idbindingsize += 1;
+
+        // start snapshot message
+        fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"started\"}\n",
+        processID, snapshotID);
+
+        // prepare and open a thread that allows the marker logic to not block passToken
+        marker_data_t *arg1 = malloc(sizeof(marker_data_t));
+        arg1->snapID = snapshotID;
+            
+        pthread_t markerThread;
+        pthread_create(&markerThread, NULL, markerSendThread, arg1);
+
+    }
+    
+    // print the send message
+    fprintf(stderr, "{proc_id: %d, sender: %s, receiver: %s, message:\"token\"}\n",
+            processID, hostNames[processID - 1], hostNames[succID - 1]);
+
+    // IMPORTANT NOTE
+    // Originally, I had the token delay + send be in a seperate thread
+    // However, this would result in cases where multiple processes would claim
+    // to have the token. This didn't sit well with me, so I decided to
+    // put the logic specifically for token delays (not marker delays) outside
+    // of the thread. The only issue here is that while the snapshotting does
+    // not block the passToken algorithm (which is good), passToken does block
+    // the snapshotting, as it prevents the processeing of the marker until
+    // after the token is delayed. In the end, I sent an email to Prof.Nita-Rotaru,
+    // and she said that passToken blocking snapshotting should be fine. Due to this,
+    // I've solidified my logic and decided to not put token passing into a thread.
+    // I may keep the code around that enables it, just in case you want a version that
+    // does not block the snapshoting, but gives more faulty results 
+    usleep(tokenDelay * 1000000);
+
+    // send to the next in the "ring"
+    if (send(outgoingChannels[succID], tokenMsg, strlen(tokenMsg), 0) == -1) {
+        printf("Error sending token\n");
+    }
+
+    hasToken = 0;
+            
+    // thread logic for the token (for a nonblocking version)
+    // would replace the usleep, send cond, and hasToken:
+    // pthread_t tokenThread;
+    // pthread_create(&tokenThread, NULL, tokenSendThread, NULL);
+
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
 
     // quickly initialize the snapshots to 0
@@ -395,6 +550,10 @@ int main(int argc, char *argv[]) {
     if (startWithToken) {
 
         int sendTokenResult = sendToken();
+        if (sendTokenResult == -1) {
+            perror("Error with token sending");
+            return -1;
+        }
 
     }
 
@@ -438,154 +597,19 @@ int main(int argc, char *argv[]) {
                         // check if we've received a marker
                         if(strncmp(msg, "marker:", 7) == 0) {
                             
-                            int receivedSnapId;
-                            sscanf(msg, "marker:%d", &receivedSnapId);    
-
-                            int idbinding = -1;
-
-                            // find the binding
-                            for (int j = 0; j < 32; j++) {
-                                
-                                if(idbindings[j] == receivedSnapId) {
-                                    idbinding = j;
-                                }
-
-                            }
-
-                            if(idbinding == -1) {
-                                idbinding = idbindingsize;
-                                idbindings[idbindingsize] = receivedSnapId;
-                                idbindingsize += 1;
-                            }
-
-                            // check if we're in the process of a snapshot
-                            if(snapshotting[idbinding] == 0) {
-
-                                int snapshotHandlerRes = snapshotHandler(idbinding, receivedSnapId, i);
-
-                            } else {
-
-                                // already received a marker, just close the channel and send the message
-                                closedChannels[idbinding][i] = 1;
-                                fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"channel closed\", channel:%d-%d, queue:[%s]}\n",
-                                processID, receivedSnapId, i, processID, channelQueues[idbinding][i]);
-
-                            }
-
-                            // we can now check here for snapshot completion
-                            int numClosed = 0;
-                            for(int i = 1; i <= host_num; i ++) {
-                                if(i != processID) {
-                                    if(closedChannels[idbinding][i] == 1) {
-                                        numClosed += 1;
-                                    }
-                                }
-                            }
-
-                            // check if we've closed all other channels (n - 1)
-                            if(numClosed == host_num - 1) {
-
-                                // time to say goodbye to our snapshotting
-                                fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"complete\"}\n",
-                                processID, receivedSnapId);
-
-                                // goodbye snapshotting state o7
-                                snapshotting[idbinding] = 0;
-                                recording[idbinding] = 0;
-
-                                //clear the queues and the closed channels for the next snapshot
-                                // make sure to only clear one of them
-                                for (int i = 1; i <= host_num; i++) {
-                                    if(i != processID) {
-                                        channelQueues[idbinding][i][0] = '\0';
-                                        closedChannels[idbinding][i] = 0;
-                                    }
-                                }
-
+                            int markerResult = markerHandler(&msg, i);
+                            if (markerResult == -1) {
+                                perror("Error with marker handling");
+                                return -1;
                             }
 
                         } else if(strcmp(msg, tokenMsg) == 0 && i == predID) {
-                            // dealing with a token, not a marker
-                            // we now have the token!
-                            hasToken = 1;
-                            // record messages while snapshotting if the channel is not closed
-                            for (int j = 0; j < 32; j ++) {
-
-                                if(recording[j] == 1 && closedChannels[j][i] == 0) {
-
-                                    if (channelQueues[j][i][0] == '\0') {
-                                        strcat(channelQueues[j][i], msg); 
-                                    } else {
-                                        strcat(channelQueues[j][i], ",");
-                                        strcat(channelQueues[j][i], msg);
-                                    }
-
-                                }
-
-                            }
-
-                            // print the received message
-                            fprintf(stderr, "{proc_id: %d, sender: %s, receiver: %s, message:\"token\"}\n",
-                                processID, hostNames[predID - 1], hostNames[processID - 1]);
-                                
-                            STATE += 1;
-                            // prints the updated state
-                            fprintf(stderr, "{proc_id: %d, state: %d}\n", processID, STATE);
-
-                            // check if we should start a snapshot
-                            // checks whether its in charge of starting a snapshot,
-                            // whether the proper state has been reached, and whether it already performed its snapshot
-                            if(snapshotStarter == 1 && STATE == snapshotDelay && completedSnapshot == 0) {
-                                
-                                completedSnapshot = 1;
-                                snapshotting[idbindingsize] = 1;
-                                idbindings[idbindingsize] = snapshotID;
-                                idbindingsize += 1;
-
-                                // start snapshot message
-                                fprintf(stderr, "{proc_id:%d, snapshot_id: %d, snapshot:\"started\"}\n",
-                                processID, snapshotID);
-                    
-                                // prepare and open a thread that allows the marker logic to not block passToken
-                                marker_data_t *arg1 = malloc(sizeof(marker_data_t));
-                                arg1->snapID = snapshotID;
-                                    
-                                pthread_t markerThread;
-                                pthread_create(&markerThread, NULL, markerSendThread, arg1);
-                    
-                            }
                             
-                            // print the send message
-                            fprintf(stderr, "{proc_id: %d, sender: %s, receiver: %s, message:\"token\"}\n",
-                                    processID, hostNames[processID - 1], hostNames[succID - 1]);
-
-                            // IMPORTANT NOTE
-                            // Originally, I had the token delay + send be in a seperate thread
-                            // However, this would result in cases where multiple processes would claim
-                            // to have the token. This didn't sit well with me, so I decided to
-                            // put the logic specifically for token delays (not marker delays) outside
-                            // of the thread. The only issue here is that while the snapshotting does
-                            // not block the passToken algorithm (which is good), passToken does block
-                            // the snapshotting, as it prevents the processeing of the marker until
-                            // after the token is delayed. In the end, I sent an email to Prof.Nita-Rotaru,
-                            // and she said that passToken blocking snapshotting should be fine. Due to this,
-                            // I've solidified my logic and decided to not put token passing into a thread.
-                            // I may keep the code around that enables it, just in case you want a version that
-                            // does not block the snapshoting, but gives more faulty results 
-                            usleep(tokenDelay * 1000000);
-
-                            // send to the next in the "ring"
-                            if (send(outgoingChannels[succID], tokenMsg, strlen(tokenMsg), 0) == -1) {
-                                printf("Error sending token\n");
+                            int tokenResult = tokenHandler(&msg, i);
+                            if (tokenResult == -1) {
+                                perror("Error with token handling");
+                                return -1;
                             }
-
-                            hasToken = 0;
-                                    
-                            // thread logic for the token (for a nonblocking version)
-                            // would replace the usleep, send cond, and hasToken:
-                            // pthread_t tokenThread;
-                            // pthread_create(&tokenThread, NULL, tokenSendThread, NULL);
-                                    
                         }    
                     }
 
